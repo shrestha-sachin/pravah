@@ -7,10 +7,14 @@ layer. They do not infer damage, closure, failure, or loss of service.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
+import numpy as np
+import rasterio
 from shapely import make_valid
+from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 
 DEFAULT_PROJECTED_CRS = "EPSG:32645"
@@ -192,3 +196,55 @@ def validate_model_mask(values: Any) -> dict[str, int]:
         "invalid_pixels": int((array == 255).sum()),
         "valid_pixels": int(np.isin(array, (0, 1)).sum()),
     }
+
+
+def validate_mask_raster(path: str | Path, aoi: gpd.GeoDataFrame | None = None) -> dict[str, Any]:
+    """Validate a P2 observed-water GeoTIFF and return its grid metadata.
+
+    The project contract uses 0 for inferred non-water, 1 for inferred water,
+    and 255 for invalid/no-observation. A supplied AOI must overlap the raster
+    footprint; this prevents producing apparently valid exposure for a scene
+    in the wrong geography.
+    """
+    raster_path = Path(path)
+    with rasterio.open(raster_path) as source:
+        if source.count != 1:
+            raise ValueError("observed_water.tif must contain exactly one band")
+        if source.crs is None:
+            raise ValueError("observed_water.tif must define a CRS")
+        transform_values = tuple(float(value) for value in source.transform[:6])
+        if not all(np.isfinite(transform_values)) or abs(source.transform.determinant) == 0:
+            raise ValueError("observed_water.tif has an invalid affine transform")
+        if source.nodata is not None and (not np.isfinite(source.nodata) or source.nodata != 255):
+            raise ValueError("observed_water.tif nodata must be unset or 255")
+        values = source.read(1)
+        counts = validate_model_mask(values)
+        if counts["valid_pixels"] == 0:
+            raise ValueError("observed_water.tif contains no valid observation pixels")
+        raster_bounds = box(source.bounds.left, source.bounds.bottom, source.bounds.right, source.bounds.top)
+        aoi_metadata: dict[str, Any] | None = None
+        if aoi is not None:
+            if aoi.crs is None or aoi.empty:
+                raise ValueError("AOI must contain features and an explicit CRS")
+            aoi_in_raster_crs = aoi.to_crs(source.crs)
+            aoi_geometry = aoi_in_raster_crs.geometry.union_all()
+            if aoi_geometry.is_empty or not raster_bounds.intersects(aoi_geometry):
+                raise ValueError("observed_water.tif does not overlap the supplied AOI")
+            aoi_metadata = {
+                "crs": str(aoi.crs),
+                "bounds": [float(value) for value in aoi.total_bounds],
+                "overlap": True,
+            }
+        return {
+            "path": str(raster_path),
+            "crs": str(source.crs),
+            "shape": [int(source.height), int(source.width)],
+            "bands": int(source.count),
+            "dtype": source.dtypes[0],
+            "nodata": source.nodata,
+            "transform": transform_values,
+            "resolution": [float(source.transform.a), float(abs(source.transform.e))],
+            "bounds": [float(source.bounds.left), float(source.bounds.bottom), float(source.bounds.right), float(source.bounds.top)],
+            "counts": counts,
+            "aoi": aoi_metadata,
+        }

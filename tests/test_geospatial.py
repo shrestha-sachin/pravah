@@ -1,9 +1,12 @@
 import geopandas as gpd
 import numpy as np
 import pytest
+import rasterio
+from rasterio.transform import from_origin
+from shapely.geometry import box
 from shapely.geometry import LineString, Polygon
 
-from pravah.gis.exposure import summarize_exposure, validate_model_mask
+from pravah.gis.exposure import summarize_exposure, validate_mask_raster, validate_model_mask
 from scripts.p3_build_infrastructure import source_identity
 
 
@@ -133,3 +136,53 @@ def test_source_identity_prefers_way_relation_and_row_fallbacks():
     assert source_identity({"osm_id": "nan", "osm_way_id": None}, "buildings", 4) == (
         "buildings:row:4", "unidentified_row"
     )
+
+
+def _write_mask(path, values, *, nodata=255, x=300000, y=3100000):
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=len(values),
+        width=len(values[0]),
+        count=1,
+        dtype="uint8",
+        crs="EPSG:32645",
+        transform=from_origin(x, y, 10, 10),
+        nodata=nodata,
+    ) as dst:
+        dst.write(np.asarray(values, dtype="uint8"), 1)
+
+
+def test_mask_raster_checks_grid_nodata_and_aoi_overlap(tmp_path):
+    path = tmp_path / "observed_water.tif"
+    _write_mask(path, [[0, 1], [255, 0]])
+    aoi = gpd.GeoDataFrame(
+        geometry=[box(300000, 3099980, 300020, 3100000)], crs="EPSG:32645"
+    )
+    result = validate_mask_raster(path, aoi)
+    assert result["counts"] == {"water_pixels": 1, "non_water_pixels": 2, "invalid_pixels": 1, "valid_pixels": 3}
+    assert result["aoi"]["overlap"] is True
+    assert result["resolution"] == [10.0, 10.0]
+
+
+def test_mask_raster_rejects_wrong_nodata_and_no_observation(tmp_path):
+    wrong_nodata = tmp_path / "wrong_nodata.tif"
+    _write_mask(wrong_nodata, [[0, 1]], nodata=99)
+    with pytest.raises(ValueError, match="nodata"):
+        validate_mask_raster(wrong_nodata)
+
+    no_observation = tmp_path / "no_observation.tif"
+    _write_mask(no_observation, [[255, 255]])
+    with pytest.raises(ValueError, match="no valid observation"):
+        validate_mask_raster(no_observation)
+
+
+def test_mask_raster_rejects_nonoverlapping_aoi(tmp_path):
+    path = tmp_path / "observed_water.tif"
+    _write_mask(path, [[0, 1]])
+    aoi = gpd.GeoDataFrame(
+        geometry=[box(400000, 3200000, 400020, 3200020)], crs="EPSG:32645"
+    )
+    with pytest.raises(ValueError, match="does not overlap"):
+        validate_mask_raster(path, aoi)
