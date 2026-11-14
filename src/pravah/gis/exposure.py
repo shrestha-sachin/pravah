@@ -14,6 +14,13 @@ from shapely import make_valid
 from shapely.geometry.base import BaseGeometry
 
 DEFAULT_PROJECTED_CRS = "EPSG:32645"
+MISSING_IDENTIFIER_VALUES = {"", "nan", "none", "null", "<na>"}
+
+
+def _identifier_present(values):
+    """Treat null-like strings as missing, including values read from GPKG."""
+    text = values.astype("string").str.strip().str.lower()
+    return values.notna() & ~text.isin(MISSING_IDENTIFIER_VALUES)
 
 
 def _clean_layer(layer: gpd.GeoDataFrame | None, projected_crs: str) -> gpd.GeoDataFrame | None:
@@ -35,10 +42,14 @@ def _clean_layer(layer: gpd.GeoDataFrame | None, projected_crs: str) -> gpd.GeoD
 def _deduplicate(frame: gpd.GeoDataFrame | None, id_columns: Iterable[str]) -> tuple[gpd.GeoDataFrame | None, int, str | None]:
     if frame is None or frame.empty:
         return frame, 0, None
-    identifier = next((name for name in id_columns if name in frame.columns), None)
+    identifier = next(
+        (name for name in id_columns if name in frame.columns and _identifier_present(frame[name]).any()),
+        None,
+    )
     if identifier is None:
         return frame, 0, None
-    duplicate = frame[identifier].notna() & frame[identifier].duplicated(keep="first")
+    present = _identifier_present(frame[identifier])
+    duplicate = present & frame[identifier].duplicated(keep="first")
     removed = int(duplicate.sum())
     return frame.loc[~duplicate].copy(), removed, identifier
 
@@ -110,10 +121,14 @@ def summarize_exposure(
             if water_target is not None:
                 water_target = water_target.intersection(aoi_target)
 
+    # Prefer the namespaced identity emitted by p3_build_infrastructure.py.
+    # For older layers, osm_way_id is more specific than osm_id. Missing
+    # identifiers are never treated as duplicates and remain separate rows.
+    identity_columns = tuple(dict.fromkeys(("source_id", "osm_way_id", "osm_id", *id_columns)))
     b, r, br = (_clean_layer(layer, projected_crs) for layer in (buildings, roads, bridges))
-    b, b_removed, b_id = _deduplicate(b, id_columns)
-    r, r_removed, r_id = _deduplicate(r, id_columns)
-    br, br_removed, br_id = _deduplicate(br, id_columns)
+    b, b_removed, b_id = _deduplicate(b, identity_columns)
+    r, r_removed, r_id = _deduplicate(r, identity_columns)
+    br, br_removed, br_id = _deduplicate(br, identity_columns)
     settlement_frame = _clean_layer(settlements, projected_crs)
     school_frame = _clean_layer(schools, projected_crs)
     healthcare_frame = _clean_layer(healthcare, projected_crs)

@@ -31,6 +31,7 @@ RASTERS = {
     "rainfall_accumulation": ("processed/rainfall/rainfall_accumulation_aug01_26.tif", 4326),
 }
 DATE_RE = re.compile(r"rainfall_(\d{4}-\d{2}-\d{2})\.tif$")
+MISSING_IDENTIFIER_VALUES = {"", "nan", "none", "null", "<na>"}
 
 
 def _sha256(path: Path) -> str:
@@ -76,6 +77,33 @@ def _load_aoi(path: Path | None, bbox: list[float] | None) -> gpd.GeoDataFrame |
     return None
 
 
+def _present_identifier(values: Any) -> np.ndarray:
+    series = values.astype("string").str.strip().str.lower()
+    return (values.notna() & ~series.isin(MISSING_IDENTIFIER_VALUES)).to_numpy()
+
+
+def _identifier_audit(frame: gpd.GeoDataFrame) -> dict[str, Any]:
+    fields = [name for name in ("source_id", "osm_id", "osm_way_id") if name in frame.columns]
+    audit: dict[str, Any] = {"fields": fields, "by_field": {}, "missing_all_identifiers": 0}
+    present_masks: list[np.ndarray] = []
+    for field in fields:
+        present = _present_identifier(frame[field])
+        values = frame.loc[present, field].astype("string")
+        duplicate_rows = int(values.duplicated(keep=False).sum())
+        audit["by_field"][field] = {
+            "populated": int(present.sum()),
+            "unique_nonempty": int(values.nunique(dropna=True)),
+            "duplicate_nonempty_rows": duplicate_rows,
+            "missing": int((~present).sum()),
+        }
+        present_masks.append(present)
+    if present_masks:
+        audit["missing_all_identifiers"] = int((~np.logical_or.reduce(present_masks)).sum())
+    else:
+        audit["missing_all_identifiers"] = int(len(frame))
+    return audit
+
+
 def _validate_vector(path: Path, aoi: gpd.GeoDataFrame | None) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     frame = gpd.read_file(path)
@@ -85,17 +113,20 @@ def _validate_vector(path: Path, aoi: gpd.GeoDataFrame | None) -> tuple[dict[str
         "crs": str(frame.crs) if frame.crs else None,
         "bounds": _bounds_dict(tuple(frame.total_bounds)) if not frame.empty else None,
         "geometry_types": {str(k): int(v) for k, v in frame.geom_type.value_counts().items()},
+        "multipart_geometry_count": int(frame.geom_type.astype("string").str.startswith("Multi").sum()),
         "null_geometry": int(frame.geometry.isna().sum()),
         "empty_geometry": int(frame.geometry.is_empty.sum()),
         "invalid_geometry": int((~frame.geometry.is_valid).sum()),
         "duplicate_ids": 0,
         "id_field": None,
+        "identifier_audit": _identifier_audit(frame),
         "aoi_intersects": None,
     }
-    identifier = next((name for name in ("osm_id", "id", "fid") if name in frame.columns), None)
+    identifier = next((name for name in ("source_id", "osm_way_id", "osm_id", "id", "fid") if name in frame.columns), None)
     if identifier:
         item["id_field"] = identifier
-        item["duplicate_ids"] = int((frame[identifier].notna() & frame[identifier].duplicated(keep=False)).sum())
+        present = _present_identifier(frame[identifier])
+        item["duplicate_ids"] = int((frame.loc[present, identifier].duplicated(keep=False)).sum())
     if aoi is not None and not frame.empty:
         aoi_metric = aoi.to_crs(frame.crs)
         item["aoi_intersects"] = int(frame.geometry.intersects(aoi_metric.geometry.union_all()).sum())
@@ -195,12 +226,28 @@ def validate(root: Path | str, aoi: gpd.GeoDataFrame | None = None, bbox: list[f
             "rainfall_availability": "unverified_retrospective",
             "terrain_product": "Copernicus GLO-30 DSM",
         },
-        "vectors": {}, "rasters": {}, "rainfall_daily": [], "rainfall_accumulation": {},
+        "source_vectors": {}, "vectors": {}, "rasters": {}, "rainfall_daily": [], "rainfall_accumulation": {},
         "warnings": [], "errors": [],
     }
     if not root.exists():
         report["errors"].append(f"data root does not exist: {root}")
         return report
+    raw_multipolygons = root / "processed/osm/osm_multipolygons.gpkg"
+    if raw_multipolygons.exists():
+        try:
+            raw = gpd.read_file(raw_multipolygons)
+            report["source_vectors"]["osm_multipolygons"] = {
+                "path": str(raw_multipolygons),
+                "count": int(len(raw)),
+                "crs": str(raw.crs) if raw.crs else None,
+                "geometry_types": {str(k): int(v) for k, v in raw.geom_type.value_counts().items()},
+                "invalid_geometry": int((~raw.geometry.is_valid).sum()),
+                "identifier_audit": _identifier_audit(raw),
+            }
+            if report["source_vectors"]["osm_multipolygons"]["invalid_geometry"]:
+                report["warnings"].append("osm_multipolygons source contains invalid geometries; thematic export repairs selected features")
+        except Exception as exc:
+            report["errors"].append(f"osm_multipolygons source: {exc}")
     for name in THEMATIC:
         path = root / "processed/osm/thematic" / f"{name}.gpkg"
         if not path.exists():
@@ -214,6 +261,9 @@ def validate(root: Path | str, aoi: gpd.GeoDataFrame | None = None, bbox: list[f
                 report["warnings"].append(
                     f"{name}: {item['duplicate_ids']} duplicate source IDs; counts are mapped geometries and require explicit deduplication"
                 )
+            missing = item["identifier_audit"]["missing_all_identifiers"]
+            if missing:
+                report["warnings"].append(f"{name}: {missing} features have no source identifier and remain distinct")
         except Exception as exc:
             report["errors"].append(f"{name}: {exc}")
     for name, (relative, epsg) in RASTERS.items():

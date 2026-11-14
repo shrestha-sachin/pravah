@@ -19,6 +19,27 @@ BBOX = (85.10, 27.85, 85.70, 28.35)
 TAG_PATTERN = re.compile(r'"((?:\\.|[^"\\])*)"=>"((?:\\.|[^"\\])*)"')
 
 
+def clean_identifier(value):
+    """Return an OSM identifier or None; never turn missing values into ``nan``."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "<na>"}:
+        return None
+    return text
+
+
+def source_identity(row, layer: str, row_number: int) -> tuple[str, str]:
+    """Build a stable namespaced identity while retaining unidentified rows."""
+    relation_id = clean_identifier(row.get("osm_id"))
+    way_id = clean_identifier(row.get("osm_way_id"))
+    if way_id:
+        return f"osm_way:{way_id}", "osm_way"
+    if relation_id:
+        return f"osm_relation:{relation_id}", "osm_relation"
+    return f"{layer}:row:{row_number}", "unidentified_row"
+
+
 def tag(row, key):
     if key in row.index:
         value = row[key]
@@ -47,8 +68,8 @@ def polygon_part(geom):
 
 
 def export(gdf, name, category, attr, destination, bounds):
-    records, repaired, skipped = [], 0, 0
-    for _, row in gdf.iterrows():
+    records, repaired, skipped, multipart = [], 0, 0, 0
+    for row_number, (_, row) in enumerate(gdf.iterrows()):
         geom = row.geometry
         if geom is None or geom.is_empty:
             skipped += 1
@@ -71,14 +92,23 @@ def export(gdf, name, category, attr, destination, bounds):
             if geom is None or geom.is_empty:
                 skipped += 1
                 continue
+        if geom.geom_type.startswith("Multi"):
+            multipart += 1
+        source_id, source_id_type = source_identity(row, name, row_number)
+        relation_id = clean_identifier(row.get("osm_id"))
+        way_id = clean_identifier(row.get("osm_way_id"))
+        name_value = clean_identifier(row.get("name")) or ""
         records.append({
-            "osm_id": str(row.get("osm_id") or ""),
-            "name": str(row.get("name") or ""),
+            "osm_id": relation_id,
+            "osm_way_id": way_id,
+            "source_id": source_id,
+            "source_id_type": source_id_type,
+            "name": name_value,
             "category": category,
             "osm_value": tag(row, attr) or "" if attr else category,
             "geometry": geom,
         })
-    output = {"features": len(records), "repaired": repaired, "skipped": skipped}
+    output = {"features": len(records), "repaired": repaired, "skipped": skipped, "multipart_geometries": multipart}
     if records:
         frame = gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
         path = destination / f"{name}.gpkg"
