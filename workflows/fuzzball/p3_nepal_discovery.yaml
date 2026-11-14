@@ -1,0 +1,37 @@
+# Nepal-first catalog discovery. No satellite imagery downloaded by this workflow.
+# VERIFY team12 / Pravah-Dataset against actual Fuzzball volume list before submission.
+version: v4
+
+volumes:
+  dataset:
+    use: team12
+    name: Pravah-Dataset
+
+jobs:
+  nepal-stac-discover:
+    image:
+      uri: docker://python:3.11-slim
+    mounts:
+      /data:
+        volume: dataset
+    script: |
+      #!/bin/sh
+      set -eu
+      test -d /data
+      test -w /data
+      python - <<'PY'
+      import urllib.request
+      url = "https://raw.githubusercontent.com/shrestha-sachin/pravah/3a78cf2fbb5ea676d222306e17a3a853f2f407b3/scripts/p3_nepal_ingest.py"
+      with urllib.request.urlopen(url, timeout=60) as response:
+          program = response.read()
+      open("/tmp/p3_nepal_ingest.py", "wb").write(program)
+      print("Downloaded PRAVAH discovery script:", len(program), "bytes")
+      PY
+      python /tmp/p3_nepal_ingest.py discover --root /data
+      find /data/manifests/stac -maxdepth 1 -type f -printf '%f %s bytes\n'
+    resource:
+      cpu:
+        cores: 1
+        affinity: NUMA
+      memory:
+        size: 1GiB
