@@ -1,0 +1,41 @@
+# Run only after P1 has reviewed /data/manifests/approved_downloads_private.json.
+# Private manifest array entries: {"url":"https://...","destination":"raw/sentinel2/...","sha256":"..."}
+# Public HTTPS only; requires that the job container can reach the data server.
+# Confirm provisioner/use/name in Fuzzball before submission.
+version: v4
+
+volumes:
+  dataset:
+    use: team12
+    name: Pravah-Dataset
+
+jobs:
+  nepal-approved-ingest:
+    image:
+      uri: docker://python:3.11-slim
+    mounts:
+      /data:
+        volume: dataset
+    script: |
+      #!/bin/sh
+      set -eu
+      test -d /data
+      test -w /data
+      test -s /data/manifests/approved_downloads_private.json
+      python - <<'PY'
+      import urllib.request
+      url = "https://raw.githubusercontent.com/shrestha-sachin/pravah/3a78cf2fbb5ea676d222306e17a3a853f2f407b3/scripts/p3_nepal_ingest.py"
+      with urllib.request.urlopen(url, timeout=60) as response:
+          program = response.read()
+      open("/tmp/p3_nepal_ingest.py", "wb").write(program)
+      PY
+      python /tmp/p3_nepal_ingest.py download \
+        --root /data \
+        --manifest /data/manifests/approved_downloads_private.json \
+        --max-gb 25
+    resource:
+      cpu:
+        cores: 1
+        affinity: NUMA
+      memory:
+        size: 2GiB
